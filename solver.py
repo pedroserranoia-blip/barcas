@@ -1,242 +1,177 @@
-/# solver.py (optimizado)
-# Motor de optimización para asignar barcos a atraques usando OR-Tools (CP-SAT)
-# - Soporta berths discretos tipo "finger"/"thead" (uno por slot)
-# - Soporta "lineales" (costado) con empaque 1D por grupos (group_id)
-# - Objetivo jerárquico: max asignados -> min desperdicio -> max márgenes
+# solver.py — Motor estable para asignación de barcos a atraques con OR-Tools (CP-SAT)
+# Compatible con Python 3.8+ (tipado clásico), validación robusta y soporte opcional de tramos lineales.
 
-from __future__ import annotations
 from ortools.sat.python import cp_model
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Tuple, Optional
 
-DEFAULT_POLICY = {
-    "alpha": 1.3,
+DEFAULT_POLICY: Dict[str, float] = {
+    "alpha": 1.3,        # W_calle >= alpha * LOA + beta
     "beta": 0.0,
-    "ukc": 0.3,
-    "fender_mono": 0.25,
-    "fender_cata": 0.40,
-    "end_margin": 0.5,
-    "tide_safety": 0.1,
-    "min_gap_linear": 0.4  # separación mínima entre barcos en costado
+    "ukc": 0.3,          # margen bajo quilla (m)
+    "tide_safety": 0.1,  # margen de marea (m)
+    "fender_mono": 0.25, # defensa por lado (monocasco)
+    "fender_cata": 0.40, # defensa por lado (catamarán)
+    "end_margin": 0.5,   # margen proa+popa dentro del finger
+    "min_gap_linear": 0.4 # separación mínima entre barcos en costado
 }
 
-# -----------------------
-# Validación de entradas
-# -----------------------
+# --------------------------------------
+# Validación de datos (robusta y simple)
+# --------------------------------------
 class BerthingValidator:
     def __init__(self) -> None:
         self.vessel_cols = ["vessel_id","loa","beam","draft","type","power_kw"]
         self.berth_cols  = ["berth_id","length","slip_width","depth","fairway_width","power_kw","type"]
-        # opcionales para lineales:
-        self.optional_berth_cols = ["group_id","position","zone","price_day"]
 
-    def _check_required(self, df: pd.DataFrame, cols: List[str], label: str, errors: List[str]):
+    def _check_required(self, df: pd.DataFrame, cols: List[str], lbl: str, errors: List[str]) -> None:
         for c in cols:
             if c not in df.columns:
-                errors.append(f"[{label}] Falta columna requerida: `{c}`")
+                errors.append(f"[{lbl}] Falta columna requerida: `{c}`")
 
-    class BerthingValidator:
-    def __init__(self) -> None:
-        self.vessel_cols = ["vessel_id","loa","beam","draft","type","power_kw"]
-        self.berth_cols  = ["berth_id","length","slip_width","depth","fairway_width","power_kw","type"]
-        # opcionales para lineales:
-        self.optional_berth_cols = ["group_id","position","zone","price_day"]
-
-    def _check_required(self, df: pd.DataFrame, cols: List[str], label: str, errors: List[str]):
-        for c in cols:
-            if c not in df.columns:
-                errors.append(f"[{label}] Falta columna requerida: `{c}`")
-
-    def validate_vessels(self, vessels: pd.DataFrame) -> tuple[bool, List[str]]:
+    def validate_vessels(self, vessels: pd.DataFrame) -> Tuple[bool, List[str]]:
         errors: List[str] = []
         self._check_required(vessels, self.vessel_cols, "Barcos", errors)
-        if errors:
-            return False, errors
+        if errors: return False, errors
 
-        # Asegurar tipos numéricos (coerce -> NaN si algo no es número)
+        # Tipos numéricos seguros
         num_cols = ["loa","beam","draft","power_kw"]
         numeric = vessels[num_cols].apply(pd.to_numeric, errors="coerce")
-
-        # Nulos en numéricos
         nulls = numeric.isnull().any()
         for col, isnull in nulls.items():
-            if isnull:
-                errors.append(f"[Barcos] Valores nulos o no numéricos en `{col}`")
-
-        # Valores negativos
+            if isnull: errors.append(f"[Barcos] Valores nulos o no numéricos en `{col}`")
         if (numeric < 0).any().any():
-            errors.append("[Barcos] Hay valores negativos en métricas (loa/beam/draft/power_kw)")
+            errors.append("[Barcos] Hay valores negativos en loa/beam/draft/power_kw")
 
         # IDs
-        if "vessel_id" not in vessels.columns:
-            errors.append("[Barcos] Falta `vessel_id`")
-        else:
-            if vessels["vessel_id"].isnull().any():
-                errors.append("[Barcos] Hay `vessel_id` vacíos")
-            if vessels["vessel_id"].duplicated().any():
-                dups = vessels.loc[vessels["vessel_id"].duplicated(), "vessel_id"].unique().tolist()
-                errors.append(f"[Barcos] IDs duplicados: {dups}")
+        if vessels["vessel_id"].isnull().any():
+            errors.append("[Barcos] Hay `vessel_id` vacíos")
+        if vessels["vessel_id"].duplicated().any():
+            dups = vessels.loc[vessels["vessel_id"].duplicated(),"vessel_id"].unique().tolist()
+            errors.append(f"[Barcos] IDs duplicados: {dups}")
+        return len(errors)==0, errors
 
-        return len(errors) == 0, errors
-
-    def validate_berths(self, berths: pd.DataFrame) -> tuple[bool, List[str]]:
+    def validate_berths(self, berths: pd.DataFrame) -> Tuple[bool, List[str]]:
         errors: List[str] = []
         self._check_required(berths, self.berth_cols, "Atraques", errors)
-        if errors:
-            return False, errors
+        if errors: return False, errors
 
-        # En los atraques, algunas columnas pueden ser opcionales según tipo:
-        # - Requerimos SIEMPRE: length, depth (numéricos)
-        # - Permitimos NaN: slip_width, fairway_width, power_kw (porque el solver ya los trata como opcionales)
-        required_numeric = ["length","depth"]
-        optional_numeric = ["slip_width","fairway_width","power_kw"]
-
-        # Convierte a numérico
-        req_df = berths[required_numeric].apply(pd.to_numeric, errors="coerce")
-        opt_df = berths[optional_numeric].apply(pd.to_numeric, errors="coerce")
-
-        # Nulos en requeridos
-        nulls_req = req_df.isnull().any()
-        for col, isnull in nulls_req.items():
-            if isnull:
-                errors.append(f"[Atraques] Valores nulos o no numéricos en requerido `{col}`")
-
-        # Negativos en requeridos
-        if (req_df < 0).any().any():
-            errors.append("[Atraques] Hay valores negativos en campos requeridos (length/depth)")
+        # length y depth son obligatorios numéricos; el resto puede ser NaN según el tipo
+        req = berths[["length","depth"]].apply(pd.to_numeric, errors="coerce")
+        if req.isnull().any().any():
+            errors.append("[Atraques] `length`/`depth` con valores nulos o no numéricos")
+        if (req < 0).any().any():
+            errors.append("[Atraques] `length`/`depth` con valores negativos")
 
         # IDs
-        if "berth_id" not in berths.columns:
-            errors.append("[Atraques] Falta `berth_id`")
-        else:
-            if berths["berth_id"].isnull().any():
-                errors.append("[Atraques] Hay `berth_id` vacíos")
-            if berths["berth_id"].duplicated().any():
-                dups = berths.loc[berths["berth_id"].duplicated(), "berth_id"].unique().tolist()
-                errors.append(f"[Atraques] IDs duplicados: {dups}")
+        if berths["berth_id"].isnull().any():
+            errors.append("[Atraques] Hay `berth_id` vacíos")
+        if berths["berth_id"].duplicated().any():
+            dups = berths.loc[berths["berth_id"].duplicated(),"berth_id"].unique().tolist()
+            errors.append(f"[Atraques] IDs duplicados: {dups}")
 
-        # Si hay tramos lineales, exige group_id
-        if "type" in berths.columns:
-            has_linear = berths["type"].astype(str).str.lower().isin(["linear","costado"]).any()
-            if has_linear and "group_id" not in berths.columns:
-                errors.append("[Atraques] Hay filas `type=linear/costado` y falta columna `group_id`")
+        # Si hay lineales, exigir group_id
+        has_linear = berths["type"].astype(str).str.lower().isin(["linear","costado"]).any()
+        if has_linear and "group_id" not in berths.columns:
+            errors.append("[Atraques] Existen filas `type=linear/costado` y falta columna `group_id`")
+        return len(errors)==0, errors
 
-        return len(errors) == 0, errors
-
-
-# -----------------------
-# Compatibilidad
-# -----------------------
-def _get_fender(vessel_type: str, policy: dict) -> float:
-    if isinstance(vessel_type, str) and vessel_type.lower().startswith("cata"):
+# --------------------------------------
+# Compatibilidad barco-atraque (detallada)
+# --------------------------------------
+def _fender(v_type: str, policy: Dict[str, float]) -> float:
+    if isinstance(v_type, str) and v_type.lower().startswith("cata"):
         return policy["fender_cata"]
     return policy["fender_mono"]
 
-def _pair_feasibility(v: dict, b: dict, policy: dict) -> tuple[bool, List[str]]:
+def _pair_feasibility(v: Dict, b: Dict, policy: Dict[str, float]) -> Tuple[bool, List[str]]:
     reasons: List[str] = []
     ok = True
-
-    # Longitud útil
-    if v["loa"] > (b["length"] - policy["end_margin"]):
+    # longitud útil
+    eff_len = b["length"] - policy["end_margin"]
+    if v["loa"] > eff_len:
         ok = False; reasons.append("longitud: LOA excede longitud útil")
 
-    # Calado con UKC + marea
+    # calado operativo
     depth_op = b["depth"] - (policy["ukc"] + policy["tide_safety"])
     if v["draft"] > depth_op:
-        ok = False; reasons.append("calado: insuficiente con margen UKC+marea")
+        ok = False; reasons.append("calado: insuficiente (con UKC+marea)")
 
-    # Ancho de slip (si aplica; en lineales/slips abiertos se puede poner NaN o gran valor)
-    if pd.notnull(b.get("slip_width", np.nan)):
-        beam_required = v["beam"] + 2*_get_fender(v.get("type",""), policy)
-        if beam_required > b["slip_width"]:
+    # ancho de slip (si disponible)
+    if "slip_width" in b and pd.notnull(b["slip_width"]):
+        required = v["beam"] + 2*_fender(v.get("type",""), policy)
+        if required > b["slip_width"]:
             ok = False; reasons.append("manga: no cabe con defensas")
 
-    # Potencia
-    if pd.notnull(b.get("power_kw", np.nan)):
+    # potencia (si aplica)
+    if "power_kw" in b and pd.notnull(b["power_kw"]):
         if v["power_kw"] > b["power_kw"]:
             ok = False; reasons.append("potencia: insuficiente")
 
-    # Calle maniobra
-    if pd.notnull(b.get("fairway_width", np.nan)):
+    # calle (si aplica)
+    if "fairway_width" in b and pd.notnull(b["fairway_width"]):
         loa_max = (b["fairway_width"] - policy["beta"]) / max(policy["alpha"], 1e-6)
         if v["loa"] > loa_max:
             ok = False; reasons.append("calle: LOA > LOA_max por maniobra")
-
     return ok, reasons
 
-def calculate_compatibility_matrix(vessels_df: pd.DataFrame, berths_df: pd.DataFrame, policy: dict) -> pd.DataFrame:
-    rows = []
+def calculate_compatibility_matrix(vessels_df: pd.DataFrame, berths_df: pd.DataFrame, policy: Dict[str, float]) -> pd.DataFrame:
+    rows: List[Dict] = []
     for _, v in vessels_df.iterrows():
         for _, b in berths_df.iterrows():
-            is_ok, reasons = _pair_feasibility(v.to_dict(), b.to_dict(), policy)
+            ok, reasons = _pair_feasibility(v.to_dict(), b.to_dict(), policy)
             rows.append({
                 "vessel_id": v["vessel_id"],
                 "berth_id": b["berth_id"],
-                "compatible": bool(is_ok),
-                "reasons": "; ".join(reasons) if reasons else "Compatible",
-                "length_margin": (b["length"] - v["loa"] - policy["end_margin"]),
-                "depth_margin": (b["depth"] - (policy["ukc"] + policy["tide_safety"]) - v["draft"]),
-                "width_margin": (b["slip_width"] - (v["beam"] + 2*_get_fender(v["type"], policy))) if pd.notnull(b.get("slip_width", np.nan)) else np.nan,
-                "power_margin": (b["power_kw"] - v["power_kw"]) if pd.notnull(b.get("power_kw", np.nan)) else np.nan
+                "compatible": bool(ok),
+                "reasons": "; ".join(reasons) if reasons else "Compatible"
             })
     return pd.DataFrame(rows)
 
-def _precheck_summary(v: dict, berths: pd.DataFrame, policy: dict) -> str:
+def _precheck_summary(v: Dict, berths: pd.DataFrame, policy: Dict[str, float]) -> str:
     counts = {"longitud":0,"calado":0,"manga":0,"potencia":0,"calle":0}
-    best = None; best_issues = 99; best_margins = {}
+    best_id: Optional[str] = None
+    best_issues = 999
     for _, b in berths.iterrows():
         ok, reasons = _pair_feasibility(v, b.to_dict(), policy)
         if ok:
-            return f"Compatible con {b['berth_id']}, no elegido por optimización global"
-        n = len(reasons)
-        if n < best_issues:
-            best = b["berth_id"]; best_issues = n
-            best_margins = {
-                "length_margin": b["length"] - v["loa"] - policy["end_margin"],
-                "depth_margin": b["depth"] - (policy["ukc"]+policy["tide_safety"]) - v["draft"],
-                "width_margin": (b["slip_width"] - (v["beam"] + 2*_get_fender(v.get("type",""), policy))) if pd.notnull(b.get("slip_width", np.nan)) else np.nan,
-                "power_margin": (b["power_kw"] - v["power_kw"]) if pd.notnull(b.get("power_kw", np.nan)) else np.nan
-            }
+            return "Compatible con algún atraque; no asignado por decisión global"
+        if len(reasons) < best_issues:
+            best_id = str(b["berth_id"]); best_issues = len(reasons)
         for r in reasons:
             for k in counts:
                 if r.startswith(k):
                     counts[k]+=1
-    detail = ", ".join([f"{k}:{v}" for k,v in counts.items()])
-    margins = " | ".join([f"{k}={best_margins.get(k, np.nan):+.2f}" for k in ["length_margin","depth_margin","width_margin","power_margin"]])
-    return f"Mejor candidato {best} (issues={best_issues}). Causas: {detail}. Márgenes: {margins}"
+    detail = ", ".join([f"{k}:{v}" for k,v in counts.items() if v>0]) or "sin detalle"
+    return f"Mejor candidato: {best_id or 'N/A'} | Causas: {detail}"
 
-# -----------------------
+# --------------------------------------
 # Solver principal
-# -----------------------
+# --------------------------------------
 def solve_assignment(
     vessels_df: pd.DataFrame,
     berths_df: pd.DataFrame,
-    policy: dict | None = None,
+    policy: Optional[Dict[str, float]] = None,
     time_limit: int = 20,
     prioritize_by: Optional[str] = None
 ):
-    """
-    Asigna barcos a:
-      - Atraques discretos (uno por slot): type in {'finger','thead'}
-      - Tramos lineales agrupados por 'group_id' con type == 'linear' (costado)
-    """
     policy = policy or DEFAULT_POLICY
 
-    vessels = vessels_df.copy()
-    berths = berths_df.copy()
     validator = BerthingValidator()
-    ok_v, err_v = validator.validate_vessels(vessels)
-    ok_b, err_b = validator.validate_berths(berths)
+    ok_v, err_v = validator.validate_vessels(vessels_df)
+    ok_b, err_b = validator.validate_berths(berths_df)
     if not ok_v or not ok_b:
         raise ValueError("Errores de validación:\n" + "\n".join(err_v+err_b))
 
+    vessels = vessels_df.copy()
+    berths  = berths_df.copy()
     vessels["type"] = vessels["type"].astype(str).str.lower()
+    berths["type"]  = berths["type"].astype(str).str.lower()
+
     if prioritize_by and prioritize_by in vessels.columns:
         vessels = vessels.sort_values(prioritize_by, ascending=False)
 
-    # Separar berths por tipo
-    berths["type"] = berths["type"].astype(str).str.lower()
     discrete = berths[berths["type"].isin(["finger","thead"])].reset_index(drop=True)
     linear   = berths[berths["type"].isin(["linear","costado"])].reset_index(drop=True)
 
@@ -246,113 +181,85 @@ def solve_assignment(
 
     model = cp_model.CpModel()
 
-    # -----------------------
-    # Parte A: slots discretos
-    # -----------------------
-    x = {}  # x[i,j] para discretos
-    compd = {}
+    # --- Discretos
+    x: Dict[Tuple[int,int], cp_model.IntVar] = {}
     for i, v in enumerate(V):
         for j, b in enumerate(Bd):
             ok, _ = _pair_feasibility(v, b, policy)
-            compd[(i,j)] = ok
             if ok:
-                x[(i,j)] = model.NewBoolVar(f"x_d_{i}_{j}")
+                x[(i,j)] = model.NewBoolVar(f"x_{i}_{j}")
 
-    # Un barco no puede ser asignado a más de una cosa (discreto o lineal)
-    # Crearemos más variables para lineal y luego haremos la suma.
-
-    # Uno por slot
+    # Un barco a lo sumo un slot/lineal (luego sumamos con y)
+    # Un slot a lo sumo un barco
     for j, _ in enumerate(Bd):
         model.Add(sum(x[(i,j)] for i,_ in enumerate(V) if (i,j) in x) <= 1)
 
-    # -----------------------
-    # Parte B: tramos lineales (costado)
-    # Agrupar por group_id; dentro de cada grupo se empaca 1D
-    # Requisito: cada fila en linear debe tener: group_id (str), length (longitud total del tramo).
-    # Si hay múltiples filas por el mismo group_id se suman por seguridad.
-    # -----------------------
-    y = {} # y[i,g] = 1 si barco i va al grupo g (lineal)
-    s = {} # start position en cm
-    groups = []
-    if len(Bl)>0:
+    # --- Lineales (opcional)
+    y: Dict[Tuple[int,str], cp_model.IntVar] = {}
+    s: Dict[Tuple[int,str], cp_model.IntVar] = {}
+    groups: List[str] = []
+    if not linear.empty:
         if "group_id" not in linear.columns:
-            raise ValueError("Atraques tipo 'linear' requieren columna `group_id`.")
-        # longitud por grupo
+            raise ValueError("Atraques `linear/costado` requieren columna `group_id`.")
         Lg = linear.groupby("group_id")["length"].sum().to_dict()
+        Gdepth = linear.groupby("group_id")["depth"].min().to_dict()
+        Gfair  = linear.groupby("group_id")["fairway_width"].min().to_dict()
+        Gpow   = linear.groupby("group_id")["power_kw"].max().to_dict()
         groups = list(Lg.keys())
 
-        # Variables por barco-grupo
         for i, v in enumerate(V):
             for g in groups:
-                # factibilidad mínima para ese grupo: usar un berth representativo del grupo (primero)
-                # aplicamos reglas salvo slip_width (normalmente NaN en costado)
                 b_rep = {
                     "length": Lg[g], "slip_width": np.nan,
-                    "depth": float(linear[linear["group_id"]==g]["depth"].min()),
-                    "fairway_width": float(linear[linear["group_id"]==g]["fairway_width"].min()),
-                    "power_kw": float(linear[linear["group_id"]==g]["power_kw"].max()) if "power_kw" in linear.columns else np.nan,
-                    "type": "linear"
+                    "depth": float(Gdepth.get(g, np.nan)),
+                    "fairway_width": float(Gfair.get(g, np.nan)),
+                    "power_kw": float(Gpow.get(g, np.nan)), "type": "linear"
                 }
                 ok, _ = _pair_feasibility(v, b_rep, policy)
                 if ok:
-                    y[(i,g)] = model.NewBoolVar(f"y_l_{i}_{g}")
-                    # posición inicial en cm para estabilidad
+                    y[(i,g)] = model.NewBoolVar(f"y_{i}_{g}")
                     s[(i,g)] = model.NewIntVar(0, int(round(100*Lg[g])), f"s_{i}_{g}")
 
-        # No solapamiento en cada grupo (NoOverlap con IntervalVar)
+        # no solapamiento por grupo (intervalos opcionales)
         for g in groups:
             intervals = []
-            # recolectar candidatos
-            cand = [(i,(i,g)) for i,_ in enumerate(V) if (i,g) in y]
-            for i, key in cand:
-                size_cm = int(round(100*(V[i]["loa"] + policy["min_gap_linear"])))
-                # Si asignado a g, crear intervalo reificado
-                interval = model.NewOptionalFixedSizeIntervalVar(
-                    s[key], size_cm, int(round(100*Lg[g])), y[key], f"I_{i}_{g}"
-                )
-                intervals.append(interval)
-            # no-overlap se garantiza con interval vars opcionales
-            model.AddNoOverlap(intervals)
-
-            # límites del tramo
             for i,_ in enumerate(V):
                 if (i,g) in y:
-                    model.Add(s[(i,g)] + int(round(100*(V[i]["loa"]))) <= int(round(100*Lg[g]))).OnlyEnforceIf(y[(i,g)])
+                    size_cm = int(round(100*(V[i]["loa"] + policy["min_gap_linear"])))
+                    interval = model.NewOptionalFixedSizeIntervalVar(
+                        s[(i,g)], size_cm, int(round(100*Lg[g])), y[(i,g)], f"I_{i}_{g}"
+                    )
+                    intervals.append(interval)
+                    # límite dentro del tramo
+                    model.Add(s[(i,g)] + int(round(100*V[i]["loa"])) <= int(round(100*Lg[g]))).OnlyEnforceIf(y[(i,g)])
+            if intervals:
+                model.AddNoOverlap(intervals)
 
-    # -----------------------
-    # Vínculo: cada barco a lo sumo a un lugar (discreto o un grupo lineal)
-    # -----------------------
+    # --- Cada barco a lo sumo a un sitio (slot o un grupo lineal)
     for i,_ in enumerate(V):
-        lhs = []
-        lhs += [x[(i,j)] for j,_ in enumerate(Bd) if (i,j) in x]
-        lhs += [y[(i,g)] for g in groups if (i,g) in y]
-        if lhs:
-            model.Add(sum(lhs) <= 1)
+        choices = [x[(i,j)] for j,_ in enumerate(Bd) if (i,j) in x]
+        choices += [y[(i,g)] for g in groups if (i,g) in y]
+        if choices:
+            model.Add(sum(choices) <= 1)
 
-    # -----------------------
-    # Objetivo multi-nivel
-    # 1) Max asignados
-    # 2) Min desperdicio (discretos: L-LOA; lineal: huecos implícitos)
-    # 3) Max márgenes de seguridad (sum de margins positivos)
-    # -----------------------
-    assign_terms = []
-    waste_terms  = []
-    safety_terms = []
+    # --- Objetivo multinivel (ponderado)
+    assign_terms: List[cp_model.IntVar] = []
+    waste_terms: List[cp_model.IntVar]  = []
+    safety_terms: List[cp_model.IntVar] = []
 
     # Discretos
     for i, v in enumerate(V):
         for j, b in enumerate(Bd):
             if (i,j) in x:
                 assign_terms.append(x[(i,j)])
-                # desperdicio
-                waste_val = max(b["length"] - v["loa"], 0.0)
                 w = model.NewIntVar(0, 100000, f"w_d_{i}_{j}")
+                waste_val = max(b["length"] - v["loa"], 0.0)
                 model.Add(w == int(round(100*waste_val))).OnlyEnforceIf(x[(i,j)])
                 model.Add(w == 0).OnlyEnforceIf(x[(i,j)].Not())
                 waste_terms.append(w)
-                # safety margins (profundidad + ancho si aplica)
-                depth_margin = b["depth"] - (policy["ukc"]+policy["tide_safety"]) - v["draft"]
+
                 sm = model.NewIntVar(0, 100000, f"sm_d_{i}_{j}")
+                depth_margin = b["depth"] - (policy["ukc"]+policy["tide_safety"]) - v["draft"]
                 model.Add(sm == int(round(100*max(depth_margin,0)))).OnlyEnforceIf(x[(i,j)])
                 model.Add(sm == 0).OnlyEnforceIf(x[(i,j)].Not())
                 safety_terms.append(sm)
@@ -362,35 +269,24 @@ def solve_assignment(
         for g in groups:
             if (i,g) in y:
                 assign_terms.append(y[(i,g)])
-                # en lineal, penalizamos inicio lejos para compactación ligera (reduce huecos)
-                # (heurística simple)
-                s_cm = s[(i,g)]
-                waste_terms.append(s_cm)  # cuanto más tarde empieza, más "waste"
-                # márgenes: usamos solo profundidad aquí
-                depth = float(linear[linear["group_id"]==g]["depth"].min())
-                depth_margin = depth - (policy["ukc"]+policy["tide_safety"]) - V[i]["draft"]
-                sm = model.NewIntVar(0, 100000, f"sm_l_{i}_{g}")
-                model.Add(sm == int(round(100*max(depth_margin,0)))).OnlyEnforceIf(y[(i,g)])
-                model.Add(sm == 0).OnlyEnforceIf(y[(i,g)].Not())
-                safety_terms.append(sm)
+                waste_terms.append(s[(i,g)])  # compactación simple
+                depth = float(Gdepth.get(g, np.nan))
+                if not np.isnan(depth):
+                    sm = model.NewIntVar(0, 100000, f"sm_l_{i}_{g}")
+                    margin = depth - (policy["ukc"]+policy["tide_safety"]) - V[i]["draft"]
+                    model.Add(sm == int(round(100*max(margin,0)))).OnlyEnforceIf(y[(i,g)])
+                    model.Add(sm == 0).OnlyEnforceIf(y[(i,g)].Not())
+                    safety_terms.append(sm)
 
-    # única función objetivo (ponderada grande para jerarquía)
-    model.Maximize(
-        1_000_000 * sum(assign_terms)
-        - 1_000 * sum(waste_terms)
-        + 1 * sum(safety_terms)
-    )
+    model.Maximize(1_000_000*sum(assign_terms) - 1_000*sum(waste_terms) + 1*sum(safety_terms))
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = float(time_limit)
     solver.parameters.num_search_workers = 8
-    result = solver.Solve(model)
+    res = solver.Solve(model)
 
-    assigned_rows = []
-    used_discrete = set()
-    used_groups: Dict[str, List[Tuple[str, float, float]]] = {}
-
-    if result in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+    assigned_rows: List[Dict] = []
+    if res in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         # Discretos
         for i, v in enumerate(V):
             for j, b in enumerate(Bd):
@@ -401,12 +297,10 @@ def solve_assignment(
                         "mode": "slot",
                         "loa": v["loa"],
                         "berth_length": b["length"],
-                        "utilization_%": round(100* v["loa"]/max(b["length"],1e-6),1),
-                        "length_margin": round(b["length"] - v["loa"],2),
-                        "depth_margin": round(b["depth"] - (policy["ukc"]+policy["tide_safety"]) - v["draft"],2)
+                        "utilization_%": round(100*v["loa"]/max(b["length"],1e-6),1),
+                        "length_margin": round(b["length"] - v["loa"], 2),
+                        "depth_margin": round(b["depth"] - (policy["ukc"]+policy["tide_safety"]) - v["draft"], 2)
                     })
-                    used_discrete.add(b["berth_id"])
-
         # Lineales
         for i,_ in enumerate(V):
             for g in groups:
@@ -416,37 +310,9 @@ def solve_assignment(
                         "vessel_id": V[i]["vessel_id"],
                         "berth_id": str(g),
                         "mode": "linear",
-                        "start_m": round(start_m,2),
+                        "start_m": round(start_m, 2),
                         "loa": V[i]["loa"],
-                        "depth_margin": round(float(linear[linear["group_id"]==g]["depth"].min()) - (policy["ukc"]+policy["tide_safety"]) - V[i]["draft"],2)
+                        "depth_margin": round(Gdepth[g] - (policy["ukc"]+policy["tide_safety"]) - V[i]["draft"], 2)
                     })
-                    used_groups.setdefault(g, []).append((V[i]["vessel_id"], start_m, start_m+V[i]["loa"]))
 
-    # No asignados + razones
-    assigned_ids = {r["vessel_id"] for r in assigned_rows}
-    unassigned_rows = []
-    all_berths_for_reason = pd.concat([discrete, linear], ignore_index=True) if len(linear)>0 else discrete
-    for i, v in enumerate(V):
-        if v["vessel_id"] not in assigned_ids:
-            reason = _precheck_summary(v, all_berths_for_reason, policy)
-            unassigned_rows.append({"vessel_id": v["vessel_id"], "reason": reason})
-
-    stats = {
-        "n_vessels": len(V),
-        "n_berths": len(berths),
-        "assigned": len(assigned_rows),
-        "unassigned": len(unassigned_rows),
-        "occupancy_pct": round(100 * (len(used_discrete) + sum(len(used_groups.get(g,[]))>0 for g in groups)) / max(1,len(berths)),1)
-    }
-
-    # análisis de motivos
-    if unassigned_rows:
-        rej = {}
-        for r in unassigned_rows:
-            t = r["reason"].lower()
-            for key in ["longitud","calado","manga","potencia","calle"]:
-                if key in t:
-                    rej[key] = rej.get(key,0)+1
-        stats["rejection_reasons"] = rej
-
-    return pd.DataFrame(assigned_rows), pd.DataFrame(unassigned_rows), stats
+    # No
