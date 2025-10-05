@@ -195,8 +195,8 @@ def solve_assignment(
             "occupancy_pct": 0.0,
             "rejection_reasons": {"validacion": len(unassigned_rows)}
         }
+        return assignments, pd.DataFrame(unassigned_rows), stats
 
-        return empty_assign, pd.DataFrame(unassigned_rows), stats
 
 
     vessels = vessels_df.copy()
