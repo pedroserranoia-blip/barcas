@@ -162,7 +162,42 @@ def solve_assignment(
     ok_v, err_v = validator.validate_vessels(vessels_df)
     ok_b, err_b = validator.validate_berths(berths_df)
     if not ok_v or not ok_b:
-        raise ValueError("Errores de validación:\n" + "\n".join(err_v+err_b))
+            # --- Validación de datos (devuelve siempre tuplas válidas, sin raise) ---
+    validator = BerthingValidator()
+    ok_v, err_v = validator.validate_vessels(vessels_df)
+    ok_b, err_b = validator.validate_berths(berths_df)
+
+    if not ok_v or not ok_b:
+        errors = (err_v or []) + (err_b or [])
+
+        # Todos los barcos pasan a "no asignados" con la razón de validación
+        unassigned_rows = []
+        if isinstance(vessels_df, pd.DataFrame) and "vessel_id" in vessels_df.columns:
+            for _, v in vessels_df.iterrows():
+                unassigned_rows.append({
+                    "vessel_id": v.get("vessel_id", "N/A"),
+                    "reason": "Errores de validación: " + " | ".join(errors) if errors else "Errores de validación"
+                })
+        else:
+            # Sin dataframe o sin columna id, devolvemos vacío
+            unassigned_rows = []
+
+        empty_assign = pd.DataFrame(columns=[
+            "vessel_id","berth_id","mode","loa","berth_length",
+            "utilization_%","length_margin","depth_margin","start_m"
+        ])
+
+        stats = {
+            "n_vessels": int(len(vessels_df)) if isinstance(vessels_df, pd.DataFrame) else 0,
+            "n_berths": int(len(berths_df)) if isinstance(berths_df, pd.DataFrame) else 0,
+            "assigned": 0,
+            "unassigned": len(unassigned_rows),
+            "occupancy_pct": 0.0,
+            "rejection_reasons": {"validacion": len(unassigned_rows)}
+        }
+
+        return empty_assign, pd.DataFrame(unassigned_rows), stats
+
 
     vessels = vessels_df.copy()
     berths  = berths_df.copy()
