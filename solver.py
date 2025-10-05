@@ -227,7 +227,7 @@ def solve_assignment(
                 if (i,g) in y:
                     size_cm = int(round(100*(V[i]["loa"] + policy["min_gap_linear"])))
                     interval = model.NewOptionalFixedSizeIntervalVar(
-                        s[(i,g)], size_cm, int(round(100*Lg[g])), y[(i,g)], f"I_{i}_{g}"
+                        s[(i,g)], size_cm, y[(i,g)], f"I_{i}_{g}"
                     )
                     intervals.append(interval)
                     # límite dentro del tramo
