@@ -1,4 +1,4 @@
-# solver.py (optimizado)
+/# solver.py (optimizado)
 # Motor de optimización para asignar barcos a atraques usando OR-Tools (CP-SAT)
 # - Soporta berths discretos tipo "finger"/"thead" (uno por slot)
 # - Soporta "lineales" (costado) con empaque 1D por grupos (group_id)
@@ -36,38 +36,94 @@ class BerthingValidator:
             if c not in df.columns:
                 errors.append(f"[{label}] Falta columna requerida: `{c}`")
 
+    class BerthingValidator:
+    def __init__(self) -> None:
+        self.vessel_cols = ["vessel_id","loa","beam","draft","type","power_kw"]
+        self.berth_cols  = ["berth_id","length","slip_width","depth","fairway_width","power_kw","type"]
+        # opcionales para lineales:
+        self.optional_berth_cols = ["group_id","position","zone","price_day"]
+
+    def _check_required(self, df: pd.DataFrame, cols: List[str], label: str, errors: List[str]):
+        for c in cols:
+            if c not in df.columns:
+                errors.append(f"[{label}] Falta columna requerida: `{c}`")
+
     def validate_vessels(self, vessels: pd.DataFrame) -> tuple[bool, List[str]]:
         errors: List[str] = []
         self._check_required(vessels, self.vessel_cols, "Barcos", errors)
-        if errors: return False, errors
-        # tipos
+        if errors:
+            return False, errors
+
+        # Asegurar tipos numéricos (coerce -> NaN si algo no es número)
         num_cols = ["loa","beam","draft","power_kw"]
-        bad = vessels[num_cols].isnull().any()
-        for c in num_cols[bad.values]:
-            errors.append(f"[Barcos] Valores nulos en `{c}`")
-        if (vessels[num_cols] < 0).any().any():
-            errors.append("[Barcos] Hay valores negativos en métricas")
-        if vessels["vessel_id"].duplicated().any():
-            dups = vessels[vessels["vessel_id"].duplicated()]["vessel_id"].unique().tolist()
-            errors.append(f"[Barcos] IDs duplicados: {dups}")
-        return len(errors)==0, errors
+        numeric = vessels[num_cols].apply(pd.to_numeric, errors="coerce")
+
+        # Nulos en numéricos
+        nulls = numeric.isnull().any()
+        for col, isnull in nulls.items():
+            if isnull:
+                errors.append(f"[Barcos] Valores nulos o no numéricos en `{col}`")
+
+        # Valores negativos
+        if (numeric < 0).any().any():
+            errors.append("[Barcos] Hay valores negativos en métricas (loa/beam/draft/power_kw)")
+
+        # IDs
+        if "vessel_id" not in vessels.columns:
+            errors.append("[Barcos] Falta `vessel_id`")
+        else:
+            if vessels["vessel_id"].isnull().any():
+                errors.append("[Barcos] Hay `vessel_id` vacíos")
+            if vessels["vessel_id"].duplicated().any():
+                dups = vessels.loc[vessels["vessel_id"].duplicated(), "vessel_id"].unique().tolist()
+                errors.append(f"[Barcos] IDs duplicados: {dups}")
+
+        return len(errors) == 0, errors
 
     def validate_berths(self, berths: pd.DataFrame) -> tuple[bool, List[str]]:
         errors: List[str] = []
         self._check_required(berths, self.berth_cols, "Atraques", errors)
-        # opcionales presentes? ok.
-        if errors: return False, errors
-        num_cols = ["length","slip_width","depth","fairway_width","power_kw"]
-        bad = berths[num_cols].isnull().any()
-        for c in num_cols[bad.values]:
-            errors.append(f"[Atraques] Valores nulos en `{c}`")
-        if (berths[num_cols] < 0).any().any():
-            errors.append("[Atraques] Hay valores negativos en métricas")
-        if berths["berth_id"].duplicated().any():
-            dups = berths[berths["berth_id"].duplicated()]["berth_id"].unique().tolist()
-            errors.append(f"[Atraques] IDs duplicados: {dups}")
-        # si hay lineales, requieren group_id y length total por grupo (sum de length si modela tramos contiguos)
-        return len(errors)==0, errors
+        if errors:
+            return False, errors
+
+        # En los atraques, algunas columnas pueden ser opcionales según tipo:
+        # - Requerimos SIEMPRE: length, depth (numéricos)
+        # - Permitimos NaN: slip_width, fairway_width, power_kw (porque el solver ya los trata como opcionales)
+        required_numeric = ["length","depth"]
+        optional_numeric = ["slip_width","fairway_width","power_kw"]
+
+        # Convierte a numérico
+        req_df = berths[required_numeric].apply(pd.to_numeric, errors="coerce")
+        opt_df = berths[optional_numeric].apply(pd.to_numeric, errors="coerce")
+
+        # Nulos en requeridos
+        nulls_req = req_df.isnull().any()
+        for col, isnull in nulls_req.items():
+            if isnull:
+                errors.append(f"[Atraques] Valores nulos o no numéricos en requerido `{col}`")
+
+        # Negativos en requeridos
+        if (req_df < 0).any().any():
+            errors.append("[Atraques] Hay valores negativos en campos requeridos (length/depth)")
+
+        # IDs
+        if "berth_id" not in berths.columns:
+            errors.append("[Atraques] Falta `berth_id`")
+        else:
+            if berths["berth_id"].isnull().any():
+                errors.append("[Atraques] Hay `berth_id` vacíos")
+            if berths["berth_id"].duplicated().any():
+                dups = berths.loc[berths["berth_id"].duplicated(), "berth_id"].unique().tolist()
+                errors.append(f"[Atraques] IDs duplicados: {dups}")
+
+        # Si hay tramos lineales, exige group_id
+        if "type" in berths.columns:
+            has_linear = berths["type"].astype(str).str.lower().isin(["linear","costado"]).any()
+            if has_linear and "group_id" not in berths.columns:
+                errors.append("[Atraques] Hay filas `type=linear/costado` y falta columna `group_id`")
+
+        return len(errors) == 0, errors
+
 
 # -----------------------
 # Compatibilidad
